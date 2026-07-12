@@ -24,13 +24,31 @@ DATA_DIR = Path(__file__).parent / "data"
 SNAP_DIR = DATA_DIR / "snapshots"
 TZ = ZoneInfo("Asia/Taipei")
 
+class _RedirectHandlerPOST(urllib.request.HTTPRedirectHandler):
+    """urllib預設不會讓307/308保留POST方法與body去跟隨重導向(視為安全防呆)。
+       但ezmoney.com.tw實際會用307導向同一個POST端點的另一節點(常見於負載平衡/CDN),
+       這裡明確允許POST帶body跟隨307/308,其餘301/302仍走預設(轉GET)行為。"""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if code in (307, 308) and req.get_method() == "POST":
+            new_req = urllib.request.Request(
+                newurl, data=req.data, headers=req.headers,
+                method="POST")
+            return new_req
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+_opener = urllib.request.build_opener(_RedirectHandlerPOST)
+
 def http_post_json(url, payload, timeout=30):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (chipflow-n5y-collector/2.0)",
-        "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Origin": "https://www.ezmoney.com.tw",
+        "Referer": "https://www.ezmoney.com.tw/ETF/Transaction/PCF",
+    })
+    with _opener.open(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 def roc_date(dt):
