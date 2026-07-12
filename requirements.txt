@@ -1,0 +1,1 @@
+# 僅用Python標準庫(urllib/json/zoneinfo),無外部依賴
