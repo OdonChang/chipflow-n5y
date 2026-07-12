@@ -1,108 +1,105 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ChipFlow N5Y Collector — 主動式ETF共識自動收集器
-================================================
-每個交易日自動執行:
-1. 從證交所 TWSE OpenAPI 抓取 ETF 每日申購買回清單 (PCF)
-2. 過濾主動式ETF (代號以A結尾, 如00981A)
-3. 與前一交易日快照比對,計算逐股逐檔增減
-4. 聚合成個股層級共識訊號 (N5Y規則: >=3檔同向=strong, 2檔=weak)
-5. 輸出 n5y_latest.json (Scanner讀取) + 累積 n5y_history.json (趨勢分析)
+ChipFlow N5Y Collector v2 — 主動式ETF共識自動收集器(逐投信端點版)
+================================================================
+架構說明(讀我!):
+證交所本身不提供PCF中央API,PCF依法規定由各投信自行公布,分散在各投信網站。
+本版本改為「逐投信端點」架構:ISSUERS字典裡每一家投信一組抓取設定,
+逐一呼叫、統一解析成相同的內部格式後再聚合。
 
-設計原則: 無API金鑰、無外部服務依賴、失敗時明確報錯不靜默。
+目前已確認可用的投信:
+- 統一投信(ezmoney.com.tw):POST /ETF/Transaction/GetPCF, body={fundCode, date, specificDate}
+  已知基金對照: 00981A→49YTW, 00403A→63YTW, 00988A→61YTW
+
+擴充新投信時,在 ISSUERS 字典新增一組設定即可,不需更動聚合/比對邏輯。
+新增方式:比照README「如何新增一家投信」章節操作。
 """
-import json, re, sys, hashlib, urllib.request
+import json, re, sys, hashlib, urllib.request, urllib.error
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
-BASE = "https://openapi.twse.com.tw/v1"
 DATA_DIR = Path(__file__).parent / "data"
 SNAP_DIR = DATA_DIR / "snapshots"
 TZ = ZoneInfo("Asia/Taipei")
 
-# 已知候選端點(依序嘗試);若全失敗則從swagger自動探索
-CANDIDATE_ENDPOINTS = [
-    "/opendata/t187ap47_L",       # 常見編號慣例,待首跑驗證
-    "/exchangeReport/ETF_PCF",
-]
-DISCOVER_KEYWORDS = ["申購買回", "申購贖回", "PCF"]
-
-def http_get_json(url, timeout=60):
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "chipflow-n5y/1.0",
+def http_post_json(url, payload, timeout=30):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (chipflow-n5y-collector/2.0)",
         "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
-def discover_endpoint():
-    """先試候選端點;失敗則抓swagger規格檔,用關鍵字找PCF資料集路徑"""
-    for ep in CANDIDATE_ENDPOINTS:
-        try:
-            data = http_get_json(BASE + ep)
-            if isinstance(data, list) and len(data) > 0:
-                print(f"[endpoint] 候選端點可用: {ep} ({len(data)}筆)")
-                return ep, data
-        except Exception as e:
-            print(f"[endpoint] 候選 {ep} 失敗: {e}")
-    print("[endpoint] 候選全數失敗,改從swagger自動探索...")
-    try:
-        spec = http_get_json(BASE + "/swagger.json")
-        for path, methods in spec.get("paths", {}).items():
-            desc = json.dumps(methods, ensure_ascii=False)
-            if any(k in desc for k in DISCOVER_KEYWORDS):
-                try:
-                    data = http_get_json(BASE + path)
-                    if isinstance(data, list) and len(data) > 0:
-                        print(f"[endpoint] swagger探索成功: {path}")
-                        return path, data
-                except Exception:
-                    continue
-    except Exception as e:
-        print(f"[endpoint] swagger探索失敗: {e}")
-    sys.exit("❌ 無法定位PCF端點。請手動開啟 https://openapi.twse.com.tw/ 搜尋'申購買回',把路徑填入CANDIDATE_ENDPOINTS")
+def roc_date(dt):
+    """西元轉民國年格式 115/07/12"""
+    return f"{dt.year-1911}/{dt.month:02d}/{dt.day:02d}"
 
-# 欄位名稱容錯對照(不同資料集欄位命名不一,首跑會print實際keys供校正)
-FIELD_ALIASES = {
-    "etf_code":   ["基金代號","ETF代號","證券代號","Code","FundCode","基金代碼"],
-    "etf_name":   ["基金名稱","ETF名稱","證券名稱","Name","FundName"],
-    "stock_code": ["成分股代號","股票代號","證券代號2","StockCode","成份股代號","股票代碼"],
-    "stock_name": ["成分股名稱","股票名稱","StockName","成份股名稱"],
-    "shares":     ["股數","持有股數","張數","Shares","持股數","股份數額"],
+# ═══════════════════════════════════════════════════════════
+# 投信端點設定表——新增投信時只需在此加一組
+# ═══════════════════════════════════════════════════════════
+def fetch_ezmoney(fund_internal_code, dt):
+    """統一投信(ezmoney.com.tw)抓取邏輯"""
+    url = "https://www.ezmoney.com.tw/ETF/Transaction/GetPCF"
+    payload = {"fundCode": fund_internal_code, "date": roc_date(dt), "specificDate": False}
+    raw = http_post_json(url, payload)
+    fund_info = raw.get("fund", {})
+    stock_no = (fund_info.get("sStockNo") or "").strip()
+    stock_name = (fund_info.get("sStockName") or fund_info.get("sFundShortName") or "").strip()
+    holdings = {}
+    for asset in raw.get("asset", []):
+        if asset.get("AssetCode") != "ST":  # 只取股票,忽略期貨(GD)等其他資產類別
+            continue
+        for d in (asset.get("Details") or []):
+            code = str(d.get("DetailCode", "")).strip()
+            if not re.match(r"^\d{4,5}$", code):  # 只保留純數字台股代號,過濾海外股票(如"AMD US")
+                continue
+            share = d.get("Share")
+            if share is None:
+                continue
+            holdings[code] = holdings.get(code, 0) + int(share)
+    return {
+        "stockNo": stock_no,
+        "stockName": stock_name,
+        "holdings": holdings,
+    }
+
+ISSUERS = {
+    "統一投信": {
+        "fetcher": fetch_ezmoney,
+        "funds": ["49YTW", "63YTW", "61YTW"],  # 00981A / 00403A / 00988A
+    },
+    # ── 新增投信範例(尚未驗證,待逐一確認端點後解除註解) ──
+    # "復華投信": {"fetcher": fetch_XXX, "funds": [...]},
+    # "群益投信": {"fetcher": fetch_XXX, "funds": [...]},
 }
-def pick(d, keys):
-    for k in keys:
-        if k in d and d[k] not in (None, ""):
-            return d[k]
-    return None
 
-def parse_pcf(raw):
-    """把原始PCF列表轉為 {etf_code: {"name":..., "holdings": {stock_code: shares}}}
-       僅保留主動式ETF(代號含字母A結尾,如00981A/00403A)"""
-    if raw and isinstance(raw[0], dict):
-        print(f"[parse] 首筆實際欄位: {list(raw[0].keys())}")
-    etfs = {}
-    skipped = 0
-    for row in raw:
-        ec = str(pick(row, FIELD_ALIASES["etf_code"]) or "").strip()
-        if not re.match(r"^\d{4,6}[A-Z]$", ec):  # 主動式ETF代號格式
-            skipped += 1
-            continue
-        sc = str(pick(row, FIELD_ALIASES["stock_code"]) or "").strip()
-        if not re.match(r"^\d{4,5}$", sc):
-            continue
-        sh_raw = pick(row, FIELD_ALIASES["shares"])
-        try:
-            sh = int(float(str(sh_raw).replace(",", "")))
-        except (TypeError, ValueError):
-            continue
-        e = etfs.setdefault(ec, {"name": str(pick(row, FIELD_ALIASES["etf_name"]) or ec), "holdings": {}, "stock_names": {}})
-        e["holdings"][sc] = e["holdings"].get(sc, 0) + sh
-        sn = pick(row, FIELD_ALIASES["stock_name"])
-        if sn: e["stock_names"][sc] = str(sn).strip()
-    print(f"[parse] 主動式ETF {len(etfs)}檔, 略過非主動列 {skipped}筆")
-    return etfs
+def fetch_all_today():
+    """呼叫所有已設定投信的所有基金,回傳 {stockNo: {name, holdings}}"""
+    today_etfs = {}
+    now = datetime.now(TZ)
+    errors = []
+    for issuer_name, cfg in ISSUERS.items():
+        fetcher = cfg["fetcher"]
+        for fund_code in cfg["funds"]:
+            try:
+                result = fetcher(fund_code, now)
+                sn = result["stockNo"]
+                if not sn:
+                    errors.append(f"{issuer_name}/{fund_code}: 回傳無股票代號,可能格式變動")
+                    continue
+                today_etfs[sn] = {"name": result["stockName"], "holdings": result["holdings"]}
+                print(f"[fetch] {issuer_name} {sn}({fund_code}) 持股{len(result['holdings'])}檔")
+            except urllib.error.HTTPError as e:
+                errors.append(f"{issuer_name}/{fund_code}: HTTP {e.code}")
+            except Exception as e:
+                errors.append(f"{issuer_name}/{fund_code}: {type(e).__name__} {e}")
+    if errors:
+        print("[fetch] 以下項目抓取失敗(不中斷,略過繼續):")
+        for e in errors: print(f"  ⚠️ {e}")
+    return today_etfs
 
 def load_prev_snapshot(today_str):
     snaps = sorted(SNAP_DIR.glob("*.json"), reverse=True)
@@ -112,13 +109,12 @@ def load_prev_snapshot(today_str):
     return None, None
 
 def aggregate(today_etfs, prev_etfs):
-    """核心聚合:逐股統計跨ETF共識"""
     stocks = {}
     stock_names = {}
-    for ec, e in today_etfs.items():
-        prev_h = (prev_etfs.get(ec) or {}).get("holdings", {}) if prev_etfs else {}
+    for sn, e in today_etfs.items():
+        prev_h = (prev_etfs.get(sn) or {}).get("holdings", {}) if prev_etfs else {}
         cur_h = e["holdings"]
-        stock_names.update(e.get("stock_names", {}))
+        stock_names_for_this_etf = {}
         all_codes = set(cur_h) | set(prev_h)
         for sc in all_codes:
             delta = cur_h.get(sc, 0) - prev_h.get(sc, 0)
@@ -126,11 +122,11 @@ def aggregate(today_etfs, prev_etfs):
                 continue
             s = stocks.setdefault(sc, {"buy": [], "sell": [], "newEntry": [], "exit": []})
             if delta > 0:
-                s["buy"].append({"etf": ec, "shares": delta})
-                if sc not in prev_h: s["newEntry"].append(ec)
+                s["buy"].append({"etf": sn, "shares": delta})
+                if sc not in prev_h: s["newEntry"].append(sn)
             else:
-                s["sell"].append({"etf": ec, "shares": delta})
-                if sc not in cur_h or cur_h.get(sc, 0) == 0: s["exit"].append(ec)
+                s["sell"].append({"etf": sn, "shares": delta})
+                if sc not in cur_h or cur_h.get(sc, 0) == 0: s["exit"].append(sn)
     records = []
     for sc, s in stocks.items():
         nb, ns = len(s["buy"]), len(s["sell"])
@@ -151,7 +147,6 @@ def aggregate(today_etfs, prev_etfs):
     return records
 
 def compute_streaks(records, history):
-    """連續同向天數:比對歷史,計算每檔股票連續N日同方向共識"""
     hist_by_date = {h["date"]: {r["code"]: r for r in h["records"]} for h in history}
     dates = sorted(hist_by_date.keys(), reverse=True)
     for r in records:
@@ -168,14 +163,13 @@ def compute_streaks(records, history):
 def main():
     now = datetime.now(TZ)
     today_str = now.strftime("%Y-%m-%d")
-    print(f"=== ChipFlow N5Y Collector {today_str} {now.strftime('%H:%M')} 台北時間 ===")
+    print(f"=== ChipFlow N5Y Collector v2 {today_str} {now.strftime('%H:%M')} 台北時間 ===")
+    print(f"[config] 已設定投信: {list(ISSUERS.keys())}, 共{sum(len(c['funds']) for c in ISSUERS.values())}檔基金")
 
-    ep, raw = discover_endpoint()
-    today_etfs = parse_pcf(raw)
+    today_etfs = fetch_all_today()
     if not today_etfs:
-        sys.exit("❌ 解析後無主動式ETF資料——可能欄位名不符,請看上方[parse]印出的實際欄位,補進FIELD_ALIASES")
+        sys.exit("❌ 全部投信抓取失敗,請檢查端點是否變動(見上方[fetch]錯誤訊息)")
 
-    # 內容雜湊防重:週末/假日API可能回舊資料,相同內容不重複存檔
     content_hash = hashlib.md5(json.dumps(today_etfs, sort_keys=True).encode()).hexdigest()
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
     for p in sorted(SNAP_DIR.glob("*.json"), reverse=True)[:1]:
@@ -186,31 +180,33 @@ def main():
 
     snap_path = SNAP_DIR / f"{today_str}.json"
     snap_path.write_text(json.dumps(today_etfs, ensure_ascii=False), encoding="utf-8")
-    print(f"[snapshot] 已存 {snap_path.name}")
+    print(f"[snapshot] 已存 {snap_path.name}(涵蓋{len(today_etfs)}檔ETF)")
 
     prev_etfs, prev_date = load_prev_snapshot(today_str)
     if prev_etfs is None:
         print("[aggregate] 首次執行,無前日快照可比對,今日僅建立基準")
-        latest = {"updated": today_str, "note": "首日基準,明日起產生異動訊號", "records": []}
+        latest = {"updated": today_str, "note": "首日基準,明日起產生異動訊號", "records": [], "issuersActive": list(ISSUERS.keys())}
     else:
         print(f"[aggregate] 與 {prev_date} 快照比對")
         hist_path = DATA_DIR / "n5y_history.json"
         history = json.loads(hist_path.read_text(encoding="utf-8")) if hist_path.exists() else []
         records = aggregate(today_etfs, prev_etfs)
         records = compute_streaks(records, history)
-        latest = {"updated": today_str, "comparedWith": prev_date,
-                  "etfCount": len(today_etfs), "records": records}
+        latest = {"updated": today_str, "comparedWith": prev_date, "etfCount": len(today_etfs),
+                  "issuersActive": list(ISSUERS.keys()), "records": records}
         history.append({"date": today_str, "records": [
             {k: r[k] for k in ("code","name","direction","consensusEtfCount","netShares","tier")}
             for r in records if r["consensusEtfCount"] >= 2]})
-        history = history[-90:]  # 保留90個交易日
+        history = history[-90:]
         hist_path.write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
         strong = [r for r in records if r["tier"] == "strong"]
         print(f"[result] 異動{len(records)}檔 | 強共識{len(strong)}檔: " +
-              ", ".join(f"{r['name']}({r['direction']}x{r['consensusEtfCount']})" for r in strong[:8]))
+              ", ".join(f"{r['code']}({r['direction']}x{r['consensusEtfCount']})" for r in strong[:8]))
 
     (DATA_DIR / "n5y_latest.json").write_text(json.dumps(latest, ensure_ascii=False, indent=1), encoding="utf-8")
     print("[done] n5y_latest.json 已更新")
+    print(f"[note] 目前僅涵蓋統一投信{len(ISSUERS['統一投信']['funds'])}檔,",
+          "尚未涵蓋其他投信(復華/群益/野村等),共識強度會被低估,詳見README擴充計畫")
 
 if __name__ == "__main__":
     main()
