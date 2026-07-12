@@ -1,0 +1,30 @@
+name: N5Y Daily PCF Collector
+on:
+  schedule:
+    - cron: '45 9 * * 1-5'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run collector
+        run: python collector.py
+      - name: Commit & push if changed
+        run: |
+          git config user.name "n5y-bot"
+          git config user.email "bot@chipflow.local"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "N5Y data $(date +'%Y-%m-%d')"
+            git push
+          fi
